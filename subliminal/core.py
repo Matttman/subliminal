@@ -2,6 +2,7 @@
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from shutil import copy2
 import io
 import itertools
 import logging
@@ -20,7 +21,7 @@ import requests
 from .exceptions import ServiceUnavailable
 from .extensions import provider_manager, refiner_manager
 from .score import compute_score as default_compute_score
-from .subtitle import SUBTITLE_EXTENSIONS, get_subtitle_path
+from .subtitle import SUBTITLE_EXTENSIONS, get_subtitle_path, Subtitle
 from .utils import hash_napiprojekt, hash_opensubtitles, hash_shooter, hash_thesubdb
 from .video import VIDEO_EXTENSIONS, Episode, Movie, Video
 
@@ -331,7 +332,7 @@ class AsyncProviderPool(ProviderPool):
         return subtitles
 
 
-def check_video(video, languages=None, age=None, undefined=False):
+def check_video(video, languages=None, age=None, undefined=False, force=False):
     """Perform some checks on the `video`.
 
     All the checks are optional. Return `False` if any of this check fails:
@@ -533,6 +534,11 @@ def scan_videos(path, age=None, archives=True):
                 logger.debug('Skipping hidden filename %r in %r', filename, dirpath)
                 continue
 
+            # skip trailers
+            if os.path.splitext(filename)[0].endswith('-trailer'):
+                logger.debug('Skipping trailer filename %r in %r', filename, dirpath)
+                continue
+
             # reconstruct the file path
             filepath = os.path.join(dirpath, filename)
 
@@ -601,7 +607,7 @@ def refine(video, episode_refiners=None, movie_refiners=None, **kwargs):
             logger.debug('Refiner exception:', exc_info=True)
 
 
-def list_subtitles(videos, languages, pool_class=ProviderPool, **kwargs):
+def list_subtitles(videos, languages, pool_class=ProviderPool, force=False, **kwargs):
     """List subtitles.
 
     The `videos` must pass the `languages` check of :func:`check_video`.
@@ -622,7 +628,7 @@ def list_subtitles(videos, languages, pool_class=ProviderPool, **kwargs):
     # check videos
     checked_videos = []
     for video in videos:
-        if not check_video(video, languages=languages):
+        if not force and not check_video(video, languages=languages):
             logger.info('Skipping video %r', video)
             continue
         checked_videos.append(video)
@@ -635,7 +641,10 @@ def list_subtitles(videos, languages, pool_class=ProviderPool, **kwargs):
     with pool_class(**kwargs) as pool:
         for video in checked_videos:
             logger.info('Listing subtitles for %r', video)
-            subtitles = pool.list_subtitles(video, languages - video.subtitle_languages)
+            if force:
+                subtitles = pool.list_subtitles(video, languages)
+            else:
+                subtitles = pool.list_subtitles(video, languages - video.subtitle_languages)
             listed_subtitles[video].extend(subtitles)
             logger.info('Found %d subtitle(s)', len(subtitles))
 
@@ -745,6 +754,15 @@ def save_subtitles(video, subtitles, single=False, directory=None, encoding=None
         if directory is not None:
             subtitle_path = os.path.join(directory, os.path.split(subtitle_path)[1])
 
+        # rename existing if it exists
+        if os.path.isfile(subtitle_path):
+            count = 1
+            newpath = subtitle_path + '.' + str(count) + '.bak'
+            while os.path.isfile(newpath):
+                count += 1
+                newpath = subtitle_path + '.' + str(count) + '.bak'
+            copy2(subtitle_path, newpath)
+
         # save content as is or in the specified encoding
         logger.info('Saving %r to %r', subtitle, subtitle_path)
         if encoding is None:
@@ -760,3 +778,22 @@ def save_subtitles(video, subtitles, single=False, directory=None, encoding=None
             break
 
     return saved_subtitles
+
+
+def download_self(self):
+    download_subtitles([self])
+    lines = self.text.split('\n\n')
+    cleaned = [''.join(s.split('\n', 1)[1:]) for s in lines if not is_ad(s)]
+    numbered = [str(i + 1) + '\n' + line for i, line in enumerate(cleaned)]
+    self.content = '\n\n'.join(numbered).encode('utf-8')
+
+
+def is_ad(line):
+    ads = ['opensubtitles', 'podnapisi', 'subtitles by']
+    if any(i in line.lower() for i in ads):
+        return True
+    else:
+        return False
+
+
+Subtitle.download = download_self
